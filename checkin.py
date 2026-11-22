@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-2026 GLaDOS 自动签到 (异常监控与 Cookie 检测增强版)
+2026 GLaDOS 自动签到 (Cookie & 任务监控 + QQ邮箱 SMTP 异常告警版)
 
 功能：
 - 全自动签到（兼容 2026 新版 glados.cloud API 与 gld:sess / koa:sess Cookie）
 - 精准检测 Cookie 有效性、API 变更、网络异常与签到结果
-- 异常时主动以非零状态码退出（sys.exit(1)），触发 GitHub Actions 失败重试与邮件告警
+- 异常时自动发送中文 HTML 告警邮件（支持 QQ 邮箱 SMTP，平时正常静默不打扰）
+- 异常时以非零状态码退出（sys.exit(1)），触发 GitHub Actions 失败重试与红叉标记
 - 输出 GitHub Actions Job Summary（含账号状态、积分、剩余天数、异常诊断）
-- 可选 PushPlus 微信推送
 """
 
 import json
 import os
+import smtplib
 import sys
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from email.header import Header
+from email.mime.text import MIMEText
+from email.utils import formataddr
 import requests
 
 # Fix Windows Unicode Output
@@ -23,7 +27,6 @@ if sys.platform.startswith('win'):
 
 # ================= 配置 =================
 
-# 域名优先级：Cloud 第一
 DOMAINS = [
     "https://glados.cloud",
     "https://glados.rocks",
@@ -36,13 +39,17 @@ HEADERS = {
     'Accept': 'application/json, text/plain, */*',
 }
 
-# 剩余天数低于该值时在日志和 Summary 中提示续期（不触发失败红叉）
 LOW_DAYS_WARN_THRESHOLD = 7
+BJ_TZ = timezone(timedelta(hours=8))
 
 # ================= 工具函数 =================
 
+def now_bj_str():
+    return datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S (北京时间)")
+
+
 def log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}")
 
 
@@ -52,11 +59,9 @@ def extract_cookie(raw: str):
         return None
     raw = raw.strip()
 
-    # 现代/旧版标准键值对格式 (gld:sess=xxx; gld:sess.sig=yyy 或 koa:sess=xxx; ...)
     if 'gld:sess=' in raw or 'koa:sess=' in raw or 'koa:sess.sig=' in raw:
         return raw
 
-    # JSON
     if raw.startswith('{'):
         try:
             token = json.loads(raw).get('token')
@@ -65,11 +70,9 @@ def extract_cookie(raw: str):
         except Exception:
             pass
 
-    # JWT Token
     if raw.count('.') == 2 and '=' not in raw and len(raw) > 50:
         return 'koa:sess=' + raw
 
-    # Standard
     return raw
 
 
@@ -101,7 +104,7 @@ def evaluate_checkin(res, http_status=None):
     """
     判定签到结果。
     返回: (is_success: bool, status_type: str, detail_msg: str)
-    status_type 取值: 'OK' | 'COOKIE_EXPIRED' | 'API_CHANGED' | 'NETWORK_ERROR' | 'FAILED'
+    status_type: 'OK' | 'COOKIE_EXPIRED' | 'API_CHANGED' | 'NETWORK_ERROR' | 'FAILED'
     """
     if is_auth_error(res, http_status):
         msg = res.get('message', f'HTTP {http_status}') if isinstance(res, dict) else f'HTTP {http_status}'
@@ -117,20 +120,16 @@ def evaluate_checkin(res, http_status=None):
     msg_lower = msg.lower()
     code = res.get('code')
 
-    # API 规则变更提示
     if 'please checkin via' in msg_lower:
         return False, 'API_CHANGED', f"GLaDOS 签到接口/Token 已变更: {msg}"
 
-    # 明确错误关键词
     error_keywords = ('fail', 'error', 'invalid', 'denied', 'forbidden')
     if any(k in msg_lower for k in error_keywords):
         return False, 'FAILED', msg or f"签到失败 (code={code})"
 
-    # 成功判定：code == 0（本次签到成功）或 code == 1（今日已签）
     if code in (0, 1):
         return True, 'OK', msg or ('Checkin succeeded' if code == 0 else 'Already checked in today')
 
-    # 兼容无 code 字段时的文案判定（包含 2026 新版 observation logged）
     success_keywords = (
         'checkin',
         'observation logged',
@@ -183,7 +182,6 @@ class GLaDOS:
 
                 self.last_http_status = resp.status_code
 
-                # 明确的认证失败，直接返回不再盲目切换域名
                 if resp.status_code in (401, 403):
                     log(f"❌ {d}{path} 返回认证错误 HTTP {resp.status_code}")
                     try:
@@ -261,7 +259,111 @@ class GLaDOS:
         return evaluate_checkin(res, self.last_http_status)
 
 
-# ================= 推送与报告 =================
+# ================= 邮件与推送 =================
+
+def build_email_html(records, errors, is_test=False):
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    secrets_url = f"https://github.com/{repo}/settings/secrets/actions" if repo else "https://github.com"
+    actions_url = f"https://github.com/{repo}/actions" if repo else "https://github.com"
+
+    banner_bg = "#e74c3c" if errors else "#27ae60"
+    banner_title = (
+        "🚨 GLaDOS 自动签到监控告警"
+        if errors
+        else ("✅ GLaDOS 邮箱告警通道测试成功" if is_test else "✅ GLaDOS 自动签到报告")
+    )
+
+    rows_html = []
+    for r in records:
+        status_badge = (
+            '<span style="color:#27ae60;font-weight:bold;">✅ 正常</span>'
+            if r['ok']
+            else f'<span style="color:#e74c3c;font-weight:bold;">❌ {r["status_type"]}</span>'
+        )
+        rows_html.append(
+            f"""
+            <tr>
+                <td style="padding:8px;border:1px solid #ddd;">{r['email']}</td>
+                <td style="padding:8px;border:1px solid #ddd;">{r['points']} ({r['points_change']})</td>
+                <td style="padding:8px;border:1px solid #ddd;">{r['left_days']} 天</td>
+                <td style="padding:8px;border:1px solid #ddd;">{status_badge}</td>
+                <td style="padding:8px;border:1px solid #ddd;">{r['detail']}</td>
+            </tr>
+            """
+        )
+
+    errors_block = ""
+    if errors:
+        err_items = "".join(f"<li style='margin:6px 0;'>{e}</li>" for e in errors)
+        errors_block = f"""
+        <div style="margin-top:16px;padding:12px 16px;background:#fff5f5;border-left:4px solid #e74c3c;border-radius:4px;">
+            <p style="margin:0 0 8px 0;font-weight:bold;color:#c0392b;">异常详情：</p>
+            <ul style="margin:0;padding-left:20px;color:#333;">{err_items}</ul>
+            <p style="margin:12px 0 0 0;font-size:13px;color:#555;">
+                💡 若提示 <b>COOKIE_EXPIRED</b>，请重新登录 <a href="https://glados.cloud">glados.cloud</a> 获取 <code>gld:sess</code> 与 <code>gld:sess.sig</code>，
+                并前往 <a href="{secrets_url}">GitHub Secrets 页面</a> 更新 <code>GLADOS_COOKIE</code>。
+            </p>
+        </div>
+        """
+
+    return f"""
+    <div style="font-family:Arial,sans-serif;max-width:680px;margin:0 auto;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden;">
+        <div style="background:{banner_bg};color:#fff;padding:16px 20px;">
+            <h2 style="margin:0;font-size:18px;">{banner_title}</h2>
+            <p style="margin:6px 0 0 0;font-size:13px;opacity:0.9;">检查时间：{now_bj_str()}</p>
+        </div>
+        <div style="padding:18px 20px;">
+            <table style="width:100%;border-collapse:collapse;font-size:14px;">
+                <thead>
+                    <tr style="background:#f7f7f7;">
+                        <th style="padding:8px;border:1px solid #ddd;text-align:left;">账号</th>
+                        <th style="padding:8px;border:1px solid #ddd;text-align:left;">积分</th>
+                        <th style="padding:8px;border:1px solid #ddd;text-align:left;">剩余天数</th>
+                        <th style="padding:8px;border:1px solid #ddd;text-align:left;">状态</th>
+                        <th style="padding:8px;border:1px solid #ddd;text-align:left;">详情</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {"".join(rows_html) if rows_html else '<tr><td colspan="5" style="padding:8px;border:1px solid #ddd;">无账号记录</td></tr>'}
+                </tbody>
+            </table>
+            {errors_block}
+            <p style="margin:16px 0 0 0;font-size:12px;color:#888;">
+                查看完整运行日志：<a href="{actions_url}">{actions_url}</a>
+            </p>
+        </div>
+    </div>
+    """
+
+
+def send_smtp_email(subject, html_content):
+    """通过 SMTP（默认 QQ 邮箱 SSL 465）发送告警或测试邮件"""
+    smtp_user = os.environ.get("SMTP_USER", "").strip()
+    smtp_pass = os.environ.get("SMTP_PASS", "").strip()
+    to_email = os.environ.get("ALERT_EMAIL", "").strip() or smtp_user
+    smtp_host = os.environ.get("SMTP_HOST", "").strip() or "smtp.qq.com"
+    smtp_port = int(os.environ.get("SMTP_PORT", "465").strip() or "465")
+
+    if not smtp_user or not smtp_pass:
+        log("ℹ️ 未配置 SMTP_USER / SMTP_PASS，跳过邮件告警发送")
+        return False
+
+    try:
+        msg = MIMEText(html_content, 'html', 'utf-8')
+        msg['From'] = formataddr((str(Header("GLaDOS 签到监控", 'utf-8')), smtp_user))
+        msg['To'] = to_email
+        msg['Subject'] = Header(subject, 'utf-8')
+
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15) as server:
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_user, [to_email], msg.as_string())
+
+        log(f"✅ 邮件通知已发送至 {to_email}")
+        return True
+    except Exception as e:
+        log(f"❌ 邮件发送失败: {e}")
+        return False
+
 
 def pushplus(token, title, content):
     if not token:
@@ -279,7 +381,7 @@ def pushplus(token, title, content):
 
 
 def write_github_summary(records, errors):
-    """写入 GitHub Actions Job Summary，便于从告警邮件点进来一眼排查"""
+    """写入 GitHub Actions Job Summary"""
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
         return
@@ -287,7 +389,7 @@ def write_github_summary(records, errors):
     lines = [
         "## GLaDOS 自动签到与监控报告",
         "",
-        f"- **运行时间 (UTC)**: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`",
+        f"- **检查时间**: `{now_bj_str()}`",
         f"- **总体状态**: {'❌ 检测到异常' if errors else '✅ 全部正常'}",
         "",
         "| # | 账号 | 积分 | 剩余天数 | 监控状态 | 详情 |",
@@ -300,10 +402,7 @@ def write_github_summary(records, errors):
         )
 
     if errors:
-        lines.extend([
-            "",
-            "### 🚨 异常诊断与修复建议",
-        ])
+        lines.extend(["", "### 🚨 异常诊断与修复建议"])
         for err in errors:
             lines.append(f"- {err}")
         lines.extend([
@@ -321,10 +420,20 @@ def write_github_summary(records, errors):
 # ================= 主程序 =================
 
 def main():
-    log("🚀 2026 GLaDOS Checkin Starting (with Cookie & Task Monitor)...")
+    log("🚀 2026 GLaDOS Checkin Starting (with Cookie Monitor & SMTP Alert)...")
+    skip_email_on_fail = os.environ.get("SKIP_EMAIL_ON_FAIL", "").lower() == "true"
+    force_alert_test = os.environ.get("FORCE_ALERT_TEST", "").lower() == "true"
+
     cookies = get_cookies()
     if not cookies:
-        log("❌ 监控告警: 未找到有效的 GLADOS_COOKIE，任务终止")
+        err = "未配置有效的 GLADOS_COOKIE 环境变量"
+        log(f"❌ 监控告警: {err}")
+        write_github_summary([], [err])
+        if not skip_email_on_fail:
+            send_smtp_email(
+                "🚨 [GLaDOS 监控告警] 未配置 GLADOS_COOKIE",
+                build_email_html([], [err]),
+            )
         sys.exit(1)
 
     results_html = []
@@ -335,20 +444,20 @@ def main():
     for i, cookie in enumerate(cookies, 1):
         g = GLaDOS(cookie)
 
-        # 1. 先检查账号状态（最直接检验 Cookie 是否仍有效）
+        # 1. 先检查账号状态（直接验证 Cookie 有效性）
         status_ok, status_type, status_msg = g.get_status()
 
         # 2. 执行签到
         checkin_ok, checkin_type, checkin_msg = g.checkin()
 
-        # 3. 刷新最新状态与积分（签到成功后刷新天数和积分）
+        # 3. 签到成功后刷新最新状态与积分
         if checkin_ok:
             refresh_ok, refresh_type, refresh_msg = g.get_status()
             if refresh_ok:
                 status_ok, status_type, status_msg = refresh_ok, refresh_type, refresh_msg
             g.get_points()
 
-        # 4. 综合判定：必须同时满足 Cookie 有效 且 签到成功
+        # 4. 综合判定
         if not status_ok:
             account_ok = False
             final_type = status_type
@@ -365,10 +474,9 @@ def main():
         if account_ok:
             success_cnt += 1
             log(f"✅ 账号#{i} 正常 | 用户: {g.email} | 积分: {g.points} ({g.points_change}) | 剩余: {g.left_days} 天 | 结果: {final_detail}")
-            # 剩余天数低预警（仅日志提示，不触发失败）
             try:
                 if int(g.left_days) <= LOW_DAYS_WARN_THRESHOLD:
-                    log(f"⚠️ 账号#{i} ({g.email}) 剩余天数仅剩 {g.left_days} 天，请注意及时用积分兑换或续期！")
+                    log(f"⚠️ 账号#{i} ({g.email}) 剩余天数仅剩 {g.left_days} 天，请注意续期或兑换！")
             except ValueError:
                 pass
         else:
@@ -387,21 +495,15 @@ def main():
             'detail': final_detail,
         })
 
-        # 组装可选的 PushPlus HTML 内容
         results_html.append(f"""
 <div style="border:2px solid {'#27ae60' if account_ok else '#e74c3c'}; padding:15px; margin-bottom:15px; border-radius:10px; background:#fff;">
     <h3 style="margin:0 0 15px 0; color:#333; border-bottom:2px solid #333; padding-bottom:8px;">{'✅' if account_ok else '❌'} {g.email}</h3>
     <p style="margin:8px 0; color:#000; font-size:16px;"><b>当前积分:</b> <span style="color:#e74c3c; font-size:22px; font-weight:bold;">{g.points}</span> <span style="color:#27ae60; font-weight:bold;">({g.points_change})</span></p>
     <p style="margin:8px 0; color:#000; font-size:16px;"><b>剩余天数:</b> <span style="font-weight:bold;">{g.left_days} 天</span></p>
     <p style="margin:8px 0; color:#000; font-size:16px;"><b>监控结果:</b> [{final_type}] {final_detail}</p>
-    <div style="margin-top:15px; padding:12px; background:#f0f0f0; border-radius:8px; border:1px solid #ccc;">
-        <p style="margin:0 0 8px 0; color:#333; font-weight:bold; font-size:15px;">🎁 兑换选项:</p>
-        <p style="margin:0; color:#000; font-size:14px; line-height:1.8;">{g.exchange_info}</p>
-    </div>
 </div>
 """)
 
-    # 写入 GitHub Actions Summary
     write_github_summary(records, errors)
 
     # 可选 PushPlus 推送
@@ -409,15 +511,35 @@ def main():
     if ptoken:
         prefix = "GLaDOS签到异常告警" if errors else "GLaDOS签到"
         title = f"{prefix}: 成功{success_cnt}/{len(cookies)}"
-        content = "".join(results_html) + f"<br><small>时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</small>"
-        pushplus(ptoken, title, content)
+        pushplus(ptoken, title, "".join(results_html) + f"<br><small>时间: {now_bj_str()}</small>")
 
-    # 核心异常监控：任何账号 Cookie 失效或签到失败，强制以非零码退出触发 GitHub Actions 失败邮件告警
+    # 邮件告警：异常时发送（若为首轮失败等待重试则暂缓发送，避免偶发抖动误报）
     if errors:
-        log(f"🚨 监控告警触发：共 {len(errors)}/{len(cookies)} 个账号异常，退出码设为 1 以触发 GitHub Actions 告警通知！")
+        if skip_email_on_fail:
+            log("⏳ 首轮检测到异常，暂缓发邮件，等待 60s 后重试确认...")
+        else:
+            has_cookie_err = any(r['status_type'] == 'COOKIE_EXPIRED' for r in records)
+            subject = (
+                "🚨 [GLaDOS 监控告警] Cookie 已过期，请尽快更新"
+                if has_cookie_err
+                else f"🚨 [GLaDOS 监控告警] 签到任务异常 ({len(errors)}/{len(cookies)} 失败)"
+            )
+            send_smtp_email(subject, build_email_html(records, errors, is_test=False))
+        log(f"🚨 监控告警触发：共 {len(errors)}/{len(cookies)} 个账号异常，退出码设为 1。")
         sys.exit(1)
 
-    log(f"🎉 监控检查通过：全部 {success_cnt}/{len(cookies)} 个账号 Cookie 与签到状态正常。")
+    # 手动测试邮件通道（即使正常也发一封测试邮件）
+    if force_alert_test:
+        log("📧 检测到测试模式 (FORCE_ALERT_TEST=true)，正在发送测试邮件验证 QQ 邮箱告警通道...")
+        ok = send_smtp_email(
+            "✅ [GLaDOS 监控测试] QQ 邮箱告警通道配置成功",
+            build_email_html(records, [], is_test=True),
+        )
+        if not ok:
+            log("❌ 测试邮件发送失败，请检查 SMTP_USER / SMTP_PASS（16位 QQ 邮箱授权码）是否正确！")
+            sys.exit(1)
+
+    log(f"🎉 监控检查通过：全部 {success_cnt}/{len(cookies)} 个账号 Cookie 与签到状态正常（静默模式，无异常不发邮件）。")
 
 
 if __name__ == '__main__':
